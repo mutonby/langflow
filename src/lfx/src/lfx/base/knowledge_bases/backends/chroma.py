@@ -94,6 +94,8 @@ class ChromaLocalBackend(BaseVectorStoreBackend):
     when ingestion and retrieval share a process.
     """
 
+    distance_metric = "l2"  # collections are created without hnsw:space, so Chroma's l2 default
+
     backend_type = BackendType.CHROMA
     _is_cloud: bool = False
 
@@ -300,6 +302,8 @@ class ChromaCloudBackend(BaseVectorStoreBackend):
     through Langflow's variable service (or env vars as a fallback) via the
     variable-name keys stored in ``backend_config``.
     """
+
+    distance_metric = "l2"  # collections are created without hnsw:space, so Chroma's l2 default
 
     backend_type = BackendType.CHROMA
     _is_cloud: bool = True

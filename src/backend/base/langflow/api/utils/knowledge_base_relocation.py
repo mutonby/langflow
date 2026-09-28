@@ -17,6 +17,7 @@ backend before the repoint can still write there afterwards.
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -35,6 +36,12 @@ if TYPE_CHECKING:
     from lfx.base.knowledge_bases.backends import BaseVectorStoreBackend
 
 RelocationStatus = Literal["relocated", "would_relocate", "skipped", "failed"]
+
+# How many source vectors decide whether a metric change is safe, and how close to
+# 1.0 their lengths must be to count as unit length.
+_METRIC_SAMPLE_SIZE = 100
+_UNIT_NORM_TOLERANCE = 1e-3
+_OPENSEARCH_SPACE_TYPES = {"cosine": "cosinesimil", "l2": "l2", "inner_product": "innerproduct"}
 
 # Some stores (OpenSearch) count newly written chunks only after a refresh, so
 # the post-copy count is polled briefly before a shortfall is treated as real.
@@ -159,6 +166,10 @@ async def _relocate_one(
             result.warnings.append(
                 f"row caches {record.chunks} chunks but the source holds {result.source_count}; using the source"
             )
+        metric_problem = await _metric_change(source, target, result)
+        if metric_problem:
+            result.reason = metric_problem
+            return result
         if dry_run:
             connection = await target.test_connection()
             if not connection.ok:
@@ -230,6 +241,39 @@ def _build_backend(
         kb_path=kb_path,
         backend_config=backend_config,
         user_id=record.user_id,
+    )
+
+
+async def _metric_change(
+    source: BaseVectorStoreBackend, target: BaseVectorStoreBackend, result: KBRelocationResult
+) -> str | None:
+    """Why the move would change what nearest-neighbour search returns, or None.
+
+    Vectors keep their values across backends but not the metric they are ranked by.
+    For unit-length vectors cosine, l2 and inner product rank neighbours the same way,
+    so only the scores change scale, which is a warning. For any other vectors the
+    ranking changes, and nothing else about the copy would show it.
+    """
+    before, after = source.distance_metric, target.distance_metric
+    if before is None or after is None or before == after:
+        return None
+    sample: list[list[float]] = []
+    async for batch in source.iter_documents(batch_size=_METRIC_SAMPLE_SIZE, include_embeddings=True):
+        sample = [list(doc.embedding) for doc in batch if doc.embedding is not None]
+        break
+    if not sample:
+        return None
+    change = f"the source ranks by {before} distance and the target by {after}"
+    if all(abs(math.sqrt(sum(x * x for x in vector)) - 1) <= _UNIT_NORM_TOLERANCE for vector in sample):
+        result.warnings.append(
+            f"{change}; these vectors are unit length, so the same neighbours come back but scores change scale"
+        )
+        return None
+    space_type = _OPENSEARCH_SPACE_TYPES.get(before, before)
+    return (
+        f"{change}, and these vectors are not unit length, so nearest-neighbour results would change. "
+        f'Give the target the source\'s metric (for OpenSearch, --target-config \'{{"space_type": "{space_type}"}}\') '
+        "and re-run"
     )
 
 
